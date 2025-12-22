@@ -270,6 +270,229 @@ mod property_tests {
         });
     }
 
+    // Feature: reverse-tunnel-service, Property 5: Transient errors are handled through retries
+    // For any transient error scenario, the system should retry the operation with exponential backoff
+    // and eventually succeed if the error condition is resolved
+    #[test]
+    fn test_transient_error_retry_handling() {
+        let mut config = ProptestConfig::default();
+        config.cases = 10; // Reduce from default 256 to 10 cases
+        proptest!(config, |(
+            failure_counts in prop::collection::vec(1u32..4u32, 1..3),
+            retry_delays in prop::collection::vec(50u64..200u64, 1..3)
+        )| {
+            let result = tokio_test::block_on(async {
+                test_transient_error_retry_handling_impl(failure_counts, retry_delays).await
+            });
+            prop_assert!(result.is_ok());
+        });
+    }
+
+    async fn test_transient_error_retry_handling_impl(
+        failure_counts: Vec<u32>,
+        retry_delays: Vec<u64>,
+    ) -> Result<()> {
+        use crate::{is_transient_error, retry_with_backoff, RetryConfig};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        for (i, &fail_count) in failure_counts.iter().enumerate() {
+            let delay_idx = i % retry_delays.len();
+            let base_delay = Duration::from_millis(retry_delays[delay_idx]);
+
+            // Test scenario 1: Transient error detection
+            {
+                // Test transient error detection
+                let transient_errors = vec![
+                    anyhow::anyhow!("Connection refused"),
+                    anyhow::anyhow!("Connection reset by peer"),
+                    anyhow::anyhow!("Connection aborted"),
+                    anyhow::anyhow!("Operation timed out"),
+                    anyhow::anyhow!("Resource temporarily unavailable"),
+                    anyhow::anyhow!("Stream reset"),
+                    anyhow::anyhow!("Session closed"),
+                    anyhow::anyhow!("Broken pipe"),
+                    anyhow::anyhow!("Network unreachable"),
+                ];
+
+                for error in transient_errors {
+                    assert!(is_transient_error(&error), 
+                           "Error '{}' should be classified as transient", error);
+                }
+
+                // Test non-transient error detection
+                let non_transient_errors = vec![
+                    anyhow::anyhow!("Permission denied"),
+                    anyhow::anyhow!("File not found"),
+                    anyhow::anyhow!("Invalid argument"),
+                    anyhow::anyhow!("Protocol error"),
+                ];
+
+                for error in non_transient_errors {
+                    assert!(!is_transient_error(&error), 
+                           "Error '{}' should not be classified as transient", error);
+                }
+            }
+
+            // Test scenario 2: Retry with eventually successful operation
+            {
+                let attempt_counter = Arc::new(Mutex::new(0u32));
+                let target_attempts = fail_count.min(3); // Limit to reasonable number
+                
+                let retry_config = RetryConfig {
+                    max_attempts: (target_attempts + 1) as usize,
+                    initial_delay: Duration::from_millis(10), // Fast for testing
+                    max_delay: Duration::from_millis(100),
+                };
+
+                let counter_clone = attempt_counter.clone();
+                let result = retry_with_backoff(
+                    || {
+                        let counter = counter_clone.clone();
+                        async move {
+                            let mut count = counter.lock().await;
+                            *count += 1;
+                            
+                            if *count <= target_attempts {
+                                // Simulate transient error
+                                Err(anyhow::anyhow!("Connection refused"))
+                            } else {
+                                // Success after retries
+                                Ok("success")
+                            }
+                        }
+                    },
+                    &retry_config,
+                    "test operation",
+                ).await;
+
+                // Should succeed after the specified number of retries
+                assert!(result.is_ok(), "Retry operation should eventually succeed");
+                assert_eq!(result.unwrap(), "success");
+                
+                let final_attempts = *attempt_counter.lock().await;
+                assert_eq!(final_attempts, target_attempts + 1, 
+                          "Should have made exactly {} attempts", target_attempts + 1);
+            }
+
+            // Test scenario 3: Retry with non-transient error (should not retry)
+            {
+                let attempt_counter = Arc::new(Mutex::new(0u32));
+                
+                let retry_config = RetryConfig {
+                    max_attempts: 3,
+                    initial_delay: Duration::from_millis(10),
+                    max_delay: Duration::from_millis(100),
+                };
+
+                let counter_clone = attempt_counter.clone();
+                let result: Result<&str> = retry_with_backoff(
+                    || {
+                        let counter = counter_clone.clone();
+                        async move {
+                            let mut count = counter.lock().await;
+                            *count += 1;
+                            
+                            // Always return non-transient error
+                            Err(anyhow::anyhow!("Permission denied"))
+                        }
+                    },
+                    &retry_config,
+                    "test operation",
+                ).await;
+
+                // Should fail immediately without retries
+                assert!(result.is_err(), "Non-transient error should fail immediately");
+                
+                let final_attempts = *attempt_counter.lock().await;
+                assert_eq!(final_attempts, 1, 
+                          "Should have made only 1 attempt for non-transient error");
+            }
+
+            // Test scenario 4: Retry exhaustion (all attempts fail)
+            {
+                let attempt_counter = Arc::new(Mutex::new(0u32));
+                let max_attempts = 3;
+                
+                let retry_config = RetryConfig {
+                    max_attempts,
+                    initial_delay: Duration::from_millis(10),
+                    max_delay: Duration::from_millis(100),
+                };
+
+                let counter_clone = attempt_counter.clone();
+                let result: Result<&str> = retry_with_backoff(
+                    || {
+                        let counter = counter_clone.clone();
+                        async move {
+                            let mut count = counter.lock().await;
+                            *count += 1;
+                            
+                            // Always return transient error
+                            Err(anyhow::anyhow!("Connection refused"))
+                        }
+                    },
+                    &retry_config,
+                    "test operation",
+                ).await;
+
+                // Should fail after exhausting all retries
+                assert!(result.is_err(), "Should fail after exhausting all retries");
+                
+                let final_attempts = *attempt_counter.lock().await;
+                assert_eq!(final_attempts, max_attempts as u32, 
+                          "Should have made exactly {} attempts", max_attempts);
+            }
+
+            // Test scenario 5: Exponential backoff timing
+            {
+                let retry_config = RetryConfig {
+                    max_attempts: 3,
+                    initial_delay: base_delay,
+                    max_delay: base_delay * 8,
+                };
+
+                let start_time = std::time::Instant::now();
+                let attempt_counter = Arc::new(Mutex::new(0u32));
+                let counter_clone = attempt_counter.clone();
+                
+                let _result: Result<&str> = retry_with_backoff(
+                    || {
+                        let counter = counter_clone.clone();
+                        async move {
+                            let mut count = counter.lock().await;
+                            *count += 1;
+                            
+                            if *count < 3 {
+                                // Fail first 2 attempts
+                                Err(anyhow::anyhow!("Connection refused"))
+                            } else {
+                                // Succeed on 3rd attempt
+                                Ok("success")
+                            }
+                        }
+                    },
+                    &retry_config,
+                    "test operation",
+                ).await;
+
+                let elapsed = start_time.elapsed();
+                
+                // Verify that some delay occurred (at least the initial delay)
+                // We expect at least 2 delays: initial_delay + initial_delay*2
+                let min_expected_delay = base_delay + base_delay * 2;
+                assert!(elapsed >= min_expected_delay, 
+                       "Exponential backoff should introduce delays. Expected at least {:?}, got {:?}", 
+                       min_expected_delay, elapsed);
+            }
+
+            // Small delay between test scenarios
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        Ok(())
+    }
+
     async fn test_connection_failure_handling_impl(
         failure_scenarios: Vec<u8>,
         failure_delays: Vec<u64>,
