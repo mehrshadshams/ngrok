@@ -1,4 +1,4 @@
-# Implementation Plan: Reverse Tunnel Service
+  # Implementation Plan: Reverse Tunnel Service
 
 ## Overview
 
@@ -20,17 +20,17 @@ This implementation plan focuses on enhancing the existing Rust reverse tunnel s
   - **Property 2: Public connection rejection without client**
   - **Validates: Requirements 1.5**
 
-- [ ] 2. Enhance server component reliability
-  - [ ] 2.1 Fix compiler warnings in server.rs
+- [x] 2. Enhance server component reliability
+  - [x] 2.1 Fix compiler warnings in server.rs
     - Remove unnecessary `mut` qualifiers
     - Add proper error context to connection handling
     - _Requirements: 8.1, 8.2_
 
-  - [ ] 2.2 Write property test for yamux session establishment
+  - [x] 2.2 Write property test for yamux session establishment
     - **Property 3: Yamux session establishment**
     - **Validates: Requirements 2.2, 2.3**
 
-  - [ ] 2.3 Write property test for connection failure handling
+  - [x] 2.3 Write property test for connection failure handling
     - **Property 4: Connection failure handling**
     - **Validates: Requirements 2.4, 2.5**
 

@@ -51,7 +51,10 @@ async fn main() -> Result<()> {
                     info!("New control connection from {}", addr);
                     handle_control_connection(socket, state_clone.clone()).await;
                 }
-                Err(e) => error!("Error accepting control connection: {}", e),
+                Err(e) => {
+                    error!("Error accepting control connection: {}", e);
+                    // Continue accepting connections despite individual failures
+                }
             }
         }
     });
@@ -68,16 +71,20 @@ async fn main() -> Result<()> {
                 let state = state.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_public_connection(socket, state).await {
-                        error!("Error handling public connection: {}", e);
+                        error!("Error handling public connection from {}: {}", addr, e);
                     }
                 });
             }
-            Err(e) => error!("Error accepting public connection: {}", e),
+            Err(e) => {
+                error!("Error accepting public connection: {}", e);
+                // Continue accepting connections despite individual failures
+            }
         }
     }
 }
 
 async fn handle_control_connection(socket: TcpStream, state: Arc<Mutex<AppState>>) {
+    let peer_addr = socket.peer_addr().ok();
     let config = Config::default();
 
     // tokio-yamux: Server side session
@@ -88,7 +95,7 @@ async fn handle_control_connection(socket: TcpStream, state: Arc<Mutex<AppState>
     {
         let mut guard = state.lock().await;
         if guard.client_control.is_some() {
-            warn!("Replacing existing client connection");
+            warn!("Replacing existing client connection with new connection from {:?}", peer_addr);
         }
         guard.client_control = Some(control);
     }
@@ -98,16 +105,16 @@ async fn handle_control_connection(socket: TcpStream, state: Arc<Mutex<AppState>
         while let Some(result) = session.next().await {
             match result {
                 Ok(stream) => {
-                    warn!("Client opened an unexpected stream");
+                    warn!("Client from {:?} opened an unexpected stream", peer_addr);
                     drop(stream);
                 }
                 Err(e) => {
-                    error!("Yamux connection error: {}", e);
+                    error!("Yamux connection error from {:?}: {}", peer_addr, e);
                     break;
                 }
             }
         }
-        info!("Control connection closed");
+        info!("Control connection from {:?} closed", peer_addr);
     });
 }
 
@@ -124,7 +131,7 @@ async fn handle_public_connection(
     };
 
     // Open stream. Control returns tokio_yamux::Stream which implements tokio AsyncRead/AsyncWrite
-    let mut yamux_stream = control
+    let yamux_stream = control
         .open_stream()
         .await
         .context("Failed to open stream to client")?;
