@@ -15,6 +15,10 @@ struct Args {
     /// Local port to forward traffic to
     #[arg(short, long, default_value_t = 3000)]
     local_port: u16,
+
+    /// Secret token for authentication
+    #[arg(long, default_value = "mysecret")]
+    secret: String,
 }
 
 #[tokio::main]
@@ -28,9 +32,38 @@ async fn main() -> Result<()> {
 
     // Connect to the server
     info!("Connecting to server at {}", args.server_addr);
-    let socket = TcpStream::connect(&args.server_addr)
+    let mut socket = TcpStream::connect(&args.server_addr)
         .await
         .context("Failed to connect to server")?;
+
+    // Handshake
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    {
+        // 1. Send Secret
+        let secret_packet = format!("{}\n", args.secret);
+        socket
+            .write_all(secret_packet.as_bytes())
+            .await
+            .context("Failed to send secret")?;
+
+        // 2. Read Response using BufReader
+        // We scope BufReader here so it is dropped before we pass socket to Yamux
+        let mut buf_reader = BufReader::new(&mut socket);
+        let mut response = String::new();
+        buf_reader
+            .read_line(&mut response)
+            .await
+            .context("Failed to read handshake response")?;
+
+        if response.trim() != "OK" {
+            anyhow::bail!("Authentication failed: Server rejected secret");
+        }
+    }
+    // BufReader dropped here, socket is free.
+    // NOTE: If server sent more than "OK\n", those bytes might have been buffered and lost.
+    // Since server waits for handshake before starting Yamux, this is safe.
+
+    info!("Authentication successful");
 
     // Setup Yamux - Client mode
     let config = Config::default();
@@ -60,7 +93,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_server_stream(mut server_stream: StreamHandle, local_port: u16) -> Result<()> {
+async fn handle_server_stream(server_stream: StreamHandle, local_port: u16) -> Result<()> {
     // Connect to local service
     let local_addr = format!("127.0.0.1:{}", local_port);
     info!("Forwarding stream to {}", local_addr);

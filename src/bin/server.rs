@@ -18,6 +18,10 @@ struct Args {
     /// Port to listen for public ingress connections
     #[arg(short, long, default_value_t = 8080)]
     public_port: u16,
+
+    /// Secret token for client authentication
+    #[arg(long, default_value = "mysecret")]
+    secret: String,
 }
 
 /// Holds the active client session/control to open new streams.
@@ -49,7 +53,8 @@ async fn main() -> Result<()> {
             match control_listener.accept().await {
                 Ok((socket, addr)) => {
                     info!("New control connection from {}", addr);
-                    handle_control_connection(socket, state_clone.clone()).await;
+                    let secret = args.secret.clone();
+                    handle_control_connection(socket, state_clone.clone(), secret).await;
                 }
                 Err(e) => {
                     error!("Error accepting control connection: {}", e);
@@ -83,8 +88,43 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn handle_control_connection(socket: TcpStream, state: Arc<Mutex<AppState>>) {
+async fn handle_control_connection(
+    mut socket: TcpStream,
+    state: Arc<Mutex<AppState>>,
+    secret: String,
+) {
     let peer_addr = socket.peer_addr().ok();
+
+    // 1. Handshake: Verify Secret
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    {
+        let mut buf_reader = BufReader::new(&mut socket);
+        let mut line = String::new();
+
+        // Read secret + newline
+        if let Err(e) = buf_reader.read_line(&mut line).await {
+            error!("Failed to read handshake from {:?}: {}", peer_addr, e);
+            return;
+        }
+
+        if line.trim() != secret {
+            error!(
+                "Invalid secret provided by {:?}. Closing connection.",
+                peer_addr
+            );
+            return;
+        }
+
+        // Send OK
+        if let Err(e) = socket.write_all(b"OK\n").await {
+            error!(
+                "Failed to write handshake response to {:?}: {}",
+                peer_addr, e
+            );
+            return;
+        }
+    }
+
     let config = Config::default();
 
     // tokio-yamux: Server side session
@@ -95,7 +135,10 @@ async fn handle_control_connection(socket: TcpStream, state: Arc<Mutex<AppState>
     {
         let mut guard = state.lock().await;
         if guard.client_control.is_some() {
-            warn!("Replacing existing client connection with new connection from {:?}", peer_addr);
+            warn!(
+                "Replacing existing client connection with new connection from {:?}",
+                peer_addr
+            );
         }
         guard.client_control = Some(control);
     }
