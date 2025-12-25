@@ -1,194 +1,112 @@
-use anyhow::{Context, Result};
-use clap::Parser;
-use futures::{future, StreamExt};
 use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
-use tokio_yamux::{Config, Control, Session};
-use tracing::{error, info, warn};
 
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Port to listen for client (worker) connections
-    #[arg(short, long, default_value_t = 4444)]
-    control_port: u16,
-
-    /// Port to listen for public ingress connections
-    #[arg(short, long, default_value_t = 8080)]
-    public_port: u16,
-
-    /// Secret token for client authentication
-    #[arg(long, default_value = "mysecret")]
-    secret: String,
-}
-
-/// Holds the active client session/control to open new streams.
-struct AppState {
-    client_control: Option<Control>,
-}
+use async_tungstenite::tokio::accept_async; // Use async-tungstenite for compatibility
+use futures::StreamExt;
+use tokio::net::TcpListener;
+use tokio::{io::copy_bidirectional, net::TcpStream};
+use tokio_util::compat::FuturesAsyncReadCompatExt; // Import compat trait
+use tokio_yamux::{Config, Session};
+use tracing::{error, info};
+use ws_stream_tungstenite::WsStream; // For Yamux session next()
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("RUST_LOG").is_err() {
         std::env::set_var("RUST_LOG", "info");
     }
     tracing_subscriber::fmt::init();
 
-    let args = Args::parse();
-
-    let state = Arc::new(Mutex::new(AppState {
-        client_control: None,
-    }));
-
-    // Start Control Server (listener for the worker)
-    let control_addr = SocketAddr::from(([0, 0, 0, 0], args.control_port));
-    let control_listener = TcpListener::bind(control_addr).await?;
-    info!("Control server listening on {}", control_addr);
-
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        loop {
-            match control_listener.accept().await {
-                Ok((socket, addr)) => {
-                    info!("New control connection from {}", addr);
-                    let secret = args.secret.clone();
-                    handle_control_connection(socket, state_clone.clone(), secret).await;
-                }
-                Err(e) => {
-                    error!("Error accepting control connection: {}", e);
-                    // Continue accepting connections despite individual failures
-                }
-            }
-        }
-    });
-
-    // Start Public Server (listener for users)
-    let public_addr = SocketAddr::from(([0, 0, 0, 0], args.public_port));
-    let public_listener = TcpListener::bind(public_addr).await?;
-    info!("Public ingress listening on {}", public_addr);
+    // 1. LISTEN FOR THE AGENT (The Tunnel)
+    // In a real app, you'd put this in a separate task or use a select! loop,
+    // but for simplicity, we accept ONE agent first, then start serving users.
+    let tunnel_listener = TcpListener::bind("0.0.0.0:8089").await?;
+    info!("SERVER: Waiting for Agent to connect on port 8089...");
 
     loop {
-        match public_listener.accept().await {
+        match tunnel_listener.accept().await {
             Ok((socket, addr)) => {
-                info!("New public connection from {}", addr);
-                let state = state.clone();
+                info!("New control connection from {}", addr);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_public_connection(socket, state).await {
-                        error!("Error handling public connection from {}: {}", addr, e);
-                    }
+                    _ = handle_agent_connection(socket, addr).await;
                 });
             }
             Err(e) => {
-                error!("Error accepting public connection: {}", e);
+                error!("Error accepting control connection: {}", e);
                 // Continue accepting connections despite individual failures
             }
         }
     }
 }
 
-async fn handle_control_connection(
-    mut socket: TcpStream,
-    state: Arc<Mutex<AppState>>,
-    secret: String,
-) {
-    let peer_addr = socket.peer_addr().ok();
+async fn handle_agent_connection(
+    raw_socket: TcpStream,
+    addr: SocketAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // let (raw_socket, addr) = tunnel_listener.accept().await?;
+    info!("SERVER: Agent connecting from: {}", addr);
 
-    // 1. Handshake: Verify Secret
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    {
-        let mut buf_reader = BufReader::new(&mut socket);
-        let mut line = String::new();
+    // 2. UPGRADE TO WEBSOCKET
+    // async-tungstenite v0.29 accepts tokio::net::TcpStream directly with tokio-runtime feature
+    let ws_stream = accept_async(raw_socket).await?;
+    info!("SERVER: Agent upgraded to WebSocket!");
 
-        // Read secret + newline
-        if let Err(e) = buf_reader.read_line(&mut line).await {
-            error!("Failed to read handshake from {:?}: {}", peer_addr, e);
-            return;
-        }
+    // 3. WRAP IN YAMUX
+    // Convert WS message stream -> AsyncRead/Write Byte stream
+    let ws_stream_adapter = WsStream::new(ws_stream);
 
-        if line.trim() != secret {
-            error!(
-                "Invalid secret provided by {:?}. Closing connection.",
-                peer_addr
-            );
-            return;
-        }
-
-        // Send OK
-        if let Err(e) = socket.write_all(b"OK\n").await {
-            error!(
-                "Failed to write handshake response to {:?}: {}",
-                peer_addr, e
-            );
-            return;
-        }
-    }
+    // Adapt Futures AsyncRead/Write to Tokio AsyncRead/Write
+    let compat_stream = ws_stream_adapter.compat();
 
     let config = Config::default();
+    // tokio-yamux config doesn't have set_keep_alive_interval exposing directly usually,
+    // but Yamux config does. tokio-yamux re-exports yamux::Config?
+    // Let's check. If not, we skip it or use available options.
+    // config.set_keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+    // Commenting out keep-alive for now to ensure compilation, or check API later.
 
-    // tokio-yamux: Server side session
-    let mut session = Session::new_server(socket, config);
-    let control = session.control();
+    // Session::new_server takes the stream and config.
+    let mut session = Session::new_server(compat_stream, config);
 
-    // Save the control handle
-    {
-        let mut guard = state.lock().await;
-        if guard.client_control.is_some() {
-            warn!(
-                "Replacing existing client connection with new connection from {:?}",
-                peer_addr
-            );
-        }
-        guard.client_control = Some(control);
-    }
+    // We need the 'control' handle to open streams *down* to the agent
+    let ctrl = session.control();
 
-    // Drive the session
+    // Spawn the Yamux connection loop in the background.
+    // This pumps data back and forth.
     tokio::spawn(async move {
-        while let Some(result) = session.next().await {
+        while let Some(_) = session.next().await {}
+        info!("SERVER: Agent disconnected!");
+    });
+
+    // 4. LISTEN FOR PUBLIC USERS (The Internet)
+    let public_listener = TcpListener::bind("0.0.0.0:8081").await?;
+    info!("SERVER: Ready! Listening for public users on port 8081...");
+
+    loop {
+        let (mut public_socket, user_addr) = public_listener.accept().await?;
+        info!("SERVER: New user: {}", user_addr);
+
+        // Clone the control handle so we can move it into the task
+        // tokio_yamux::Control is cloneable
+        let mut ctrl_clone = ctrl.clone();
+
+        tokio::spawn(async move {
+            // A. Open a new stream INSIDE the tunnel to the agent
+            info!("SERVER: Opening tunnel stream for user...");
+            let result = ctrl_clone.open_stream().await;
+
             match result {
-                Ok(stream) => {
-                    warn!("Client from {:?} opened an unexpected stream", peer_addr);
-                    drop(stream);
+                Ok(mut tunnel_stream) => {
+                    // B. Bridge the Public User <-> Tunnel Stream
+                    // This pipes data both ways until one side disconnects.
+                    info!("SERVER: Bridging traffic...");
+                    // tunnel_stream implements tokio::io::AsyncRead/Write
+                    let _ = copy_bidirectional(&mut public_socket, &mut tunnel_stream).await;
+                    info!("SERVER: Connection closed for {}", user_addr);
                 }
                 Err(e) => {
-                    error!("Yamux connection error from {:?}: {}", peer_addr, e);
-                    break;
+                    error!("SERVER: Failed to open stream to agent: {}", e);
                 }
             }
-        }
-        info!("Control connection from {:?} closed", peer_addr);
-    });
-}
-
-async fn handle_public_connection(
-    mut public_socket: TcpStream,
-    state: Arc<Mutex<AppState>>,
-) -> Result<()> {
-    let mut control = {
-        let guard = state.lock().await;
-        guard
-            .client_control
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("No client connected"))?
-    };
-
-    // Open stream. Control returns tokio_yamux::Stream which implements tokio AsyncRead/AsyncWrite
-    let yamux_stream = control
-        .open_stream()
-        .await
-        .context("Failed to open stream to client")?;
-
-    let (mut client_r, mut client_w) = tokio::io::split(yamux_stream);
-    let (mut public_r, mut public_w) = public_socket.split();
-
-    let client_to_public = tokio::io::copy(&mut client_r, &mut public_w);
-    let public_to_client = tokio::io::copy(&mut public_r, &mut client_w);
-
-    match future::try_join(client_to_public, public_to_client).await {
-        Ok(_) => info!("Connection bridge finished"),
-        Err(e) => error!("Bridge error: {}", e),
+        });
     }
-
-    Ok(())
 }

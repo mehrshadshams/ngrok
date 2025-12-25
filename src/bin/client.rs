@@ -1,19 +1,22 @@
-use anyhow::{Context, Result};
+use async_tungstenite::tokio::connect_async;
 use clap::Parser;
-use futures::{future, StreamExt};
+use futures::StreamExt;
+use tokio::io::copy_bidirectional;
 use tokio::net::TcpStream;
-use tokio_yamux::{Config, Session, StreamHandle};
+use tokio_util::compat::FuturesAsyncReadCompatExt; // Import compat
+use tokio_yamux::{Config, Session}; // Import StreamHandle
 use tracing::{error, info};
+use ws_stream_tungstenite::WsStream; // For Yamux session next
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Address of that ngrok server's control port
-    #[arg(short, long, default_value = "127.0.0.1:4444")]
+    #[arg(short, long, default_value = "127.0.0.1:8089")]
     server_addr: String,
 
     /// Local port to forward traffic to
-    #[arg(short, long, default_value_t = 3000)]
+    #[arg(short, long)]
     local_port: u16,
 
     /// Secret token for authentication
@@ -22,7 +25,7 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("RUST_LOG").is_err() {
         std::env::set_var("RUST_LOG", "info");
     }
@@ -30,88 +33,53 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Connect to the server
-    info!("Connecting to server at {}", args.server_addr);
-    let mut socket = TcpStream::connect(&args.server_addr)
-        .await
-        .context("Failed to connect to server")?;
+    // CONFIGURATION
+    // Where is the public server?
+    // Matches server2.rs listening port 8089
+    let server_url = format!("ws://{}", args.server_addr);
+    // Where is your local app?
+    let local_app_addr = format!("127.0.0.1:{}", args.local_port);
 
-    // Handshake
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    {
-        // 1. Send Secret
-        let secret_packet = format!("{}\n", args.secret);
-        socket
-            .write_all(secret_packet.as_bytes())
-            .await
-            .context("Failed to send secret")?;
+    info!("AGENT: Connecting to server at {server_url}...");
 
-        // 2. Read Response using BufReader
-        // We scope BufReader here so it is dropped before we pass socket to Yamux
-        let mut buf_reader = BufReader::new(&mut socket);
-        let mut response = String::new();
-        buf_reader
-            .read_line(&mut response)
-            .await
-            .context("Failed to read handshake response")?;
+    // 1. CONNECT TO SERVER (WebSocket)
+    // connect_async accepts &str which implements IntoClientRequest
+    let (ws_stream, _) = connect_async(server_url).await?;
+    info!("AGENT: Connected to Server via WebSocket!");
 
-        if response.trim() != "OK" {
-            anyhow::bail!("Authentication failed: Server rejected secret");
-        }
-    }
-    // BufReader dropped here, socket is free.
-    // NOTE: If server sent more than "OK\n", those bytes might have been buffered and lost.
-    // Since server waits for handshake before starting Yamux, this is safe.
+    // 2. WRAP IN YAMUX
+    let ws_stream_adapter = WsStream::new(ws_stream);
 
-    info!("Authentication successful");
+    // Adapt Futures AsyncRead/Write to Tokio AsyncRead/Write
+    let compat_stream = ws_stream_adapter.compat();
 
-    // Setup Yamux - Client mode
     let config = Config::default();
-    let mut session = Session::new_client(socket, config);
+    let mut session = Session::new_client(compat_stream, config);
 
-    info!("Connected using Yamux. Waiting for incoming streams...");
+    info!("AGENT: Connected using Yamux. Waiting for incoming requests...");
 
-    // Accept incoming streams from the server
-    while let Some(result) = session.next().await {
-        match result {
-            Ok(server_stream) => {
-                info!("Server opened a new stream!");
-                let local_port = args.local_port;
-                tokio::spawn(async move {
-                    if let Err(e) = handle_server_stream(server_stream, local_port).await {
-                        error!("Error handling stream: {}", e);
+    // 3. LISTEN FOR INCOMING STREAMS FROM SERVER
+    // The server "opens" streams when a public user hits port 8081 (as per server2.rs).
+    while let Some(stream_result) = session.next().await {
+        match stream_result {
+            Ok(mut tunnel_stream) => {
+                // tunnel_stream is tokio_yamux::StreamHandle
+                info!("AGENT: Incoming request! Connecting to local app...");
+
+                // 4. CONNECT TO LOCAL APP
+                match TcpStream::connect(local_app_addr.clone()).await {
+                    Ok(mut local_socket) => {
+                        // 5. BRIDGE TUNNEL <-> LOCAL APP
+                        tokio::spawn(async move {
+                            let _ = copy_bidirectional(&mut tunnel_stream, &mut local_socket).await;
+                            info!("AGENT: Request finished.");
+                        });
                     }
-                });
+                    Err(e) => error!("AGENT: Failed to connect to local app: {e}"),
+                }
             }
-            Err(e) => {
-                error!("Connection error: {}", e);
-                break;
-            }
+            Err(e) => error!("AGENT: Multiplex connection error: {e}"),
         }
-    }
-
-    Ok(())
-}
-
-async fn handle_server_stream(server_stream: StreamHandle, local_port: u16) -> Result<()> {
-    // Connect to local service
-    let local_addr = format!("127.0.0.1:{}", local_port);
-    info!("Forwarding stream to {}", local_addr);
-
-    let mut local_socket = TcpStream::connect(&local_addr)
-        .await
-        .context("Failed to connect to local service")?;
-
-    // server_stream already implements tokio::io::AsyncRead/Write
-    let (mut server_r, mut server_w) = tokio::io::split(server_stream);
-    let (mut local_r, mut local_w) = local_socket.split();
-
-    let server_to_local = tokio::io::copy(&mut server_r, &mut local_w);
-    let local_to_server = tokio::io::copy(&mut local_r, &mut server_w);
-
-    match future::try_join(server_to_local, local_to_server).await {
-        Ok(_) => info!("Tunnel closed successfully"),
-        Err(e) => error!("Tunnel error: {}", e),
     }
 
     Ok(())

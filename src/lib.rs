@@ -89,7 +89,7 @@ where
     // If we exhausted all retries, return the last error
     Err(last_error
         .unwrap_or_else(|| anyhow::anyhow!("Operation failed"))
-        .context(format!("Failed {} after {} attempts", operation_name, attempts)))
+        .context(format!("Failed {operation_name} after {attempts} attempts")))
 }
 
 /// Holds the active client session/control to open new streams.
@@ -149,7 +149,7 @@ pub async fn handle_control_connection(socket: TcpStream, state: Arc<Mutex<AppSt
 
 /// Handle a public connection by creating a stream to the client
 pub async fn handle_public_connection(
-    mut public_socket: TcpStream,
+    public_socket: TcpStream,
     state: Arc<Mutex<AppState>>,
 ) -> Result<()> {
     handle_public_connection_with_retry(public_socket, state, &RetryConfig::default()).await
@@ -215,7 +215,7 @@ pub async fn handle_server_stream_with_retry(
     retry_config: &RetryConfig,
 ) -> Result<()> {
     // Connect to local service with retry logic for transient failures
-    let local_addr = format!("127.0.0.1:{}", local_port);
+    let local_addr = format!("127.0.0.1:{local_port}");
     info!("Forwarding stream to {}", local_addr);
 
     let mut local_socket = retry_with_backoff(

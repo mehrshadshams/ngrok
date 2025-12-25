@@ -21,14 +21,14 @@ The system consists of two binaries:
 ### 1. Start the Relay Server
 The server routes traffic from the public world to your connected client.
 ```bash
-# Listen on control port 4444 and public ingress port 8080
+# Listen on control port 8089 and public ingress port 8081
 cargo run --bin server
 ```
 
 ### 2. Start the Local Client
 The client connects to the server and forwards traffic to your local app (e.g., running on port 3000).
 ```bash
-# Connect to server at 127.0.0.1:4444 and forward to localhost:3000
+# Connect to server at 127.0.0.1:8089 and forward to localhost:3000
 cargo run --bin client -- --local-port 3000
 ```
 
@@ -39,7 +39,7 @@ Start a local web server (e.g., Python) and access it through the tunnel.
 python3 -m http.server 3000
 
 # Access via the public ingress port
-curl http://localhost:8080/
+curl http://localhost:8081/
 ```
 
 ## 🗺️ Production Roadmap
